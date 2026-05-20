@@ -2,32 +2,39 @@
  * Meridian Client — WebSocket Sync Engine
  *
  * Handles:
- * - WebSocket connection with auto-reconnect (exponential backoff)
+ * - Transport connection with auto-reconnect (exponential backoff)
  * - Online/offline detection
- * - Push: Send pending operations to server
+ * - Push: Send pending operations to server (with E2E transit encryption)
  * - Pull: Request changes since last known seqNum
  * - Ack: Mark operations as confirmed
  * - Reject: Rollback operations
  * - Auth: Token management with auto-refresh
  */
 
-import type {
-  ClientMessage,
-  ServerMessage,
-  CRDTOperation,
-  PendingOp,
-  ConnectionState,
-  AckMessage,
-  RejectMessage,
-  ChangesMessage,
-  FullSyncRequiredMessage,
-  AuthExpiringMessage,
+import {
+  type ClientMessage,
+  type ServerMessage,
+  type CRDTOperation,
+  type PendingOp,
+  type ConnectionState,
+  type AckMessage,
+  type RejectMessage,
+  type ChangesMessage,
+  type FullSyncRequiredMessage,
+  type AuthExpiringMessage,
+  type Transport,
+  WebSocketTransport,
+  encryptValue,
+  uint8ToBase64,
+  base64ToUint8,
 } from 'meridian-shared';
 import type { MeridianStore } from './store.js';
 
 export interface SyncConfig {
   /** WebSocket server URL */
-  serverUrl: string;
+  serverUrl?: string;
+  /** Custom transport instance */
+  transport?: Transport;
   /** Store instance */
   store: MeridianStore;
   /** Auth token provider */
@@ -53,7 +60,7 @@ const VALID_SERVER_MESSAGE_TYPES = new Set([
   'full-sync-required', 'auth-expiring', 'auth-expired', 'auth-ack', 'error',
 ]);
 
-/** Validate incoming WebSocket message structure */
+/** Validate incoming server message structure */
 function validateMessage(msg: unknown): msg is ServerMessage {
   if (typeof msg !== 'object' || msg === null) return false;
   const m = msg as Record<string, unknown>;
@@ -61,10 +68,10 @@ function validateMessage(msg: unknown): msg is ServerMessage {
 }
 
 /**
- * WebSocket sync engine for Meridian client.
+ * WebSocket sync engine for Meridian client using pluggable transport.
  */
 export class SyncEngine {
-  private ws: WebSocket | null = null;
+  private transport: Transport | null = null;
   private readonly config: SyncConfig;
   private state: ConnectionState = 'disconnected';
   private retryDelay = INITIAL_RETRY_DELAY;
@@ -73,9 +80,16 @@ export class SyncEngine {
   private lastPongTime: number = Date.now();
   private pushInProgress = false;
   private destroyed = false;
+  private stateListeners: Set<(state: ConnectionState) => void> = new Set();
 
   constructor(config: SyncConfig) {
     this.config = config;
+  }
+
+  onStateChange(cb: (state: ConnectionState) => void): () => void {
+    this.stateListeners.add(cb);
+    cb(this.state);
+    return () => this.stateListeners.delete(cb);
   }
 
   // ─── Connection Management ──────────────────────────────────────────────────
@@ -108,10 +122,10 @@ export class SyncEngine {
       window.removeEventListener('offline', this.handleOffline);
     }
 
-    if (this.ws) {
-      this.ws.onclose = null; // Prevent auto-reconnect
-      this.ws.close();
-      this.ws = null;
+    if (this.transport) {
+      this.transport.onClose(() => {}); // Clear listener
+      this.transport.close();
+      this.transport = null;
     }
 
     this.setState('disconnected');
@@ -147,15 +161,21 @@ export class SyncEngine {
   // ─── Internal Connection ────────────────────────────────────────────────────
 
   private async connect(): Promise<void> {
-    if (this.destroyed || this.ws) return;
+    if (this.destroyed || this.transport) return;
 
     this.setState('connecting');
 
     try {
-      this.ws = new WebSocket(this.config.serverUrl);
+      if (this.config.transport) {
+        this.transport = this.config.transport;
+      } else if (this.config.serverUrl) {
+        this.transport = new WebSocketTransport(this.config.serverUrl);
+      } else {
+        throw new Error('[Meridian Sync] Either serverUrl or transport must be provided.');
+      }
 
-      this.ws.onopen = async () => {
-        this.log('🔌 WebSocket connected');
+      this.transport.onOpen(async () => {
+        this.log('🔌 Transport connected');
         this.retryDelay = INITIAL_RETRY_DELAY;
         this.startHeartbeat();
 
@@ -174,45 +194,44 @@ export class SyncEngine {
           await this.config.store.resetPendingStatus();
           await this.sync();
         }
-      };
+      });
 
-      this.ws.onmessage = (event) => {
-        const raw = event.data as string;
-        
-        if (raw === 'pong') {
+      this.transport.onMessage(async (msg: any) => {
+        if (msg.type === 'pong') {
           this.lastPongTime = Date.now();
           return;
         }
 
         try {
-          const parsed = JSON.parse(raw);
-          if (!validateMessage(parsed)) {
+          if (!validateMessage(msg)) {
             this.log('❌ Invalid message format, ignoring');
             return;
           }
-          this.handleMessage(parsed);
+          await this.handleMessage(msg);
         } catch (e) {
-          this.log('❌ Failed to parse message:', e);
+          this.log('❌ Failed to handle message:', e);
         }
-      };
+      });
 
-      this.ws.onerror = (event) => {
-        this.log('❌ WebSocket error');
-      };
+      this.transport.onError((err) => {
+        this.log('❌ Transport error:', err.message);
+      });
 
-      this.ws.onclose = () => {
-        this.log('🔌 WebSocket closed');
-        this.ws = null;
+      this.transport.onClose((code, reason) => {
+        this.log(`🔌 Transport closed: ${code} - ${reason}`);
+        this.transport = null;
         this.clearHeartbeat();
         this.setState('disconnected');
 
         if (!this.destroyed) {
           this.scheduleReconnect();
         }
-      };
+      });
+
+      await this.transport.connect();
     } catch (e) {
       this.log('❌ Connection failed:', e);
-      this.ws = null;
+      this.transport = null;
       this.setState('disconnected');
 
       if (!this.destroyed) {
@@ -251,12 +270,12 @@ export class SyncEngine {
     this.clearHeartbeat();
     this.lastPongTime = Date.now();
     this.heartbeatInterval = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send('ping');
+      if (this.transport?.connected) {
+        this.send('ping' as any);
         
         if (Date.now() - this.lastPongTime > HEARTBEAT_INTERVAL * 2) {
           this.log('⚠️ Dead connection detected (no pong received)');
-          this.ws.close();
+          this.transport.close();
         }
       }
     }, HEARTBEAT_INTERVAL);
@@ -295,7 +314,7 @@ export class SyncEngine {
 
       case 'auth-expired':
         this.log('🔒 Auth expired — disconnecting');
-        this.ws?.close();
+        this.transport?.close();
         break;
 
       case 'auth-ack':
@@ -342,7 +361,21 @@ export class SyncEngine {
     this.setState('syncing');
     this.log(`⬇️ Received ${msg.changes.length} changes`);
 
-    const ops = msg.changes.map(c => c.op);
+    // Integrate E2E Transit Decryption
+    const enc = this.config.store.config.encryption;
+    const ops = await Promise.all(msg.changes.map(async (c) => {
+      let opToApply = c.op;
+      if (enc && enc.fields.includes(c.op.field) && typeof c.op.value === 'string') {
+        try {
+          const uint8 = base64ToUint8(c.op.value);
+          opToApply = { ...c.op, value: uint8 };
+        } catch (e) {
+          this.log(`❌ Failed to decode/decrypt received op value for field ${c.op.field}:`, e);
+        }
+      }
+      return opToApply;
+    }));
+
     await this.config.store.applyRemoteChanges(ops);
 
     // Update lastSeq to highest received
@@ -380,7 +413,7 @@ export class SyncEngine {
    * Push all pending operations to the server.
    */
   async pushPendingOps(): Promise<void> {
-    if (this.pushInProgress || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (this.pushInProgress || !this.transport || !this.transport.connected) return;
 
     this.pushInProgress = true;
 
@@ -400,9 +433,20 @@ export class SyncEngine {
 
         await this.config.store.markOpsSending(opIds);
 
+        // Integrate E2E Transit Encryption
+        const enc = this.config.store.config.encryption;
+        const processedOps = await Promise.all(batch.map(async (p) => {
+          if (enc && enc.fields.includes(p.op.field) && typeof p.op.value === 'string') {
+            const encrypted = await encryptValue(enc.key, p.op.value);
+            const base64 = uint8ToBase64(encrypted);
+            return { ...p.op, value: base64 };
+          }
+          return p.op;
+        }));
+
         this.send({
           type: 'push',
-          ops: batch.map(p => p.op),
+          ops: processedOps,
         });
       }
     } finally {
@@ -414,7 +458,7 @@ export class SyncEngine {
    * Pull changes from server since last known seqNum.
    */
   async pullChanges(): Promise<void> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (!this.transport || !this.transport.connected) return;
 
     const lastSeq = await this.config.store.getLastSeq();
     this.log(`⬇️ Pulling changes since seq=${lastSeq}`);
@@ -429,7 +473,7 @@ export class SyncEngine {
 
   private handleOnline = (): void => {
     this.log('🌐 Online — reconnecting');
-    if (!this.ws && !this.destroyed) {
+    if (!this.transport && !this.destroyed) {
       this.retryDelay = INITIAL_RETRY_DELAY;
       this.connect();
     }
@@ -444,8 +488,8 @@ export class SyncEngine {
   // ─── Utilities ──────────────────────────────────────────────────────────────
 
   public send(msg: ClientMessage): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg));
+    if (this.transport?.connected) {
+      this.transport.send(msg);
     }
   }
 
@@ -453,6 +497,13 @@ export class SyncEngine {
     if (this.state === state) return;
     this.state = state;
     this.config.onConnectionChange?.(state);
+    for (const listener of this.stateListeners) {
+      try {
+        listener(state);
+      } catch (e) {
+        console.error('[SyncEngine] State listener error:', e);
+      }
+    }
   }
 
   private log(...args: unknown[]): void {

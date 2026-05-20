@@ -62,9 +62,13 @@ export class WebSocketTransport implements Transport {
     return this.ws?.readyState === WebSocket.OPEN;
   }
 
-  send(msg: ClientMessage | ServerMessage): void {
+  send(msg: ClientMessage | ServerMessage | string): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg));
+      if (typeof msg === 'string') {
+        this.ws.send(msg);
+      } else {
+        this.ws.send(JSON.stringify(msg));
+      }
     }
   }
 
@@ -91,8 +95,13 @@ export class WebSocketTransport implements Transport {
       this.ws.onerror = (e) => { this._onError?.(new Error('WebSocket error')); reject(e); };
       this.ws.onclose = (e) => { this._onClose?.(e.code, e.reason); };
       this.ws.onmessage = (event) => {
+        const rawData = event.data as string;
+        if (rawData === 'pong') {
+          this._onMessage?.({ type: 'pong' } as any);
+          return;
+        }
         try {
-          const msg = JSON.parse(event.data as string);
+          const msg = JSON.parse(rawData);
           this._onMessage?.(msg);
         } catch {
           // Ignore non-JSON messages

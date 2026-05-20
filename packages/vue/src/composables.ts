@@ -42,12 +42,12 @@ export function useLiveQuery(
 
   watch(
     () => [options.where, options.orderBy, options.limit],
-    () => {
+    (newVal, oldVal, onCleanup) => {
       const query = collection.live(options);
       const unsub = query.subscribe((result) => {
         data.value = result;
       });
-      return unsub;
+      onCleanup(unsub);
     },
     { immediate: true }
   );
@@ -79,19 +79,18 @@ export function useDoc(
 export function useSync(client: MeridianClient) {
   const connected = ref(false);
   const pendingCount = ref(0);
-  let interval: ReturnType<typeof setInterval>;
+  const lastSync = ref<Date | null>(null);
 
   onMounted(() => {
-    interval = setInterval(async () => {
-      connected.value = client.connectionState === 'connected';
-      const pending = await client.debug.getPendingOps();
-      pendingCount.value = pending.length;
-    }, 1000);
+    const unsub = client.onSyncChange((state) => {
+      connected.value = state.connected;
+      pendingCount.value = state.pendingCount;
+      lastSync.value = state.lastSync;
+    });
+    onUnmounted(unsub);
   });
 
-  onUnmounted(() => clearInterval(interval));
-
-  return { connected, pendingCount };
+  return { connected, pendingCount, lastSync };
 }
 
 // ─── usePresence ───────────────────────────────────────────────────────────

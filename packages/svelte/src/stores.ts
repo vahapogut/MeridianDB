@@ -34,9 +34,15 @@ export function useQuery<T>(query: Query<T>) {
 
 export function useLiveQuery(collection: CollectionProxy, options: LiveQueryOptions = {}) {
   let data = $state<Record<string, unknown>[] | undefined>(undefined);
-  const depKey = `${options.orderBy || ''}-${options.limit || 0}-${Object.entries(options.where || {}).sort().join(',')}`;
 
   $effect(() => {
+    // Read options properties inside the effect to trigger Svelte 5 reactive tracking
+    options.orderBy;
+    options.limit;
+    if (options.where) {
+      JSON.stringify(options.where);
+    }
+
     const query = collection.live(options);
     const unsub = query.subscribe((result) => {
       data = result;
@@ -69,19 +75,21 @@ export function useDoc(collection: CollectionProxy, getDocId: () => string | nul
 export function useSync(client: MeridianClient) {
   let connected = $state(false);
   let pendingCount = $state(0);
+  let lastSync = $state<Date | null>(null);
 
   $effect(() => {
-    const interval = setInterval(async () => {
-      connected = client.connectionState === 'connected';
-      const pending = await client.debug.getPendingOps();
-      pendingCount = pending.length;
-    }, 1000);
-    return () => clearInterval(interval);
+    const unsub = client.onSyncChange((state) => {
+      connected = state.connected;
+      pendingCount = state.pendingCount;
+      lastSync = state.lastSync;
+    });
+    return unsub;
   });
 
   return {
     get connected() { return connected; },
     get pendingCount() { return pendingCount; },
+    get lastSync() { return lastSync; },
   };
 }
 

@@ -24,6 +24,9 @@
  *   serverUrl: 'ws://localhost:3000/sync',
  * });
  *
+ * // Wait for database to initialize (optional, or just start calling crud immediately)
+ * await db.ready();
+ *
  * // Write
  * await db.todos.put({ id: '1', title: 'Buy milk', done: false });
  *
@@ -36,10 +39,11 @@ import {
   type SchemaDefinition,
   type ConnectionState,
   type PendingOp,
+  type Transport,
   HLC,
   generateNodeId,
 } from 'meridian-shared';
-import { MeridianStore } from './store.js';
+import { MeridianStore, type EncryptionConfig } from './store.js';
 import { SyncEngine } from './sync.js';
 import { CollectionProxy } from './reactive.js';
 import { TabCoordinator } from './tab-coordinator.js';
@@ -53,7 +57,13 @@ export interface MeridianClientConfig {
   schema: SchemaDefinition;
 
   /** WebSocket server URL (e.g., 'ws://localhost:3000/sync') */
-  serverUrl: string;
+  serverUrl?: string;
+
+  /** Optional custom Transport instance (WebSocket, WebRTC, etc.) */
+  transport?: Transport;
+
+  /** Optional E2E encryption configuration */
+  encryption?: EncryptionConfig;
 
   /**
    * Authentication provider.
@@ -66,7 +76,7 @@ export interface MeridianClientConfig {
 
   /**
    * Database name for IndexedDB.
-   * Defaults to a hash of the serverUrl.
+   * Defaults to a hash of the serverUrl or 'meridian_db'.
    */
   dbName?: string;
 
@@ -97,6 +107,14 @@ export interface MeridianClientConfig {
  * Each collection is a `CollectionProxy` with find/put/update/delete methods.
  */
 export interface MeridianClient {
+  /** Await IndexedDB initialization completion */
+  ready(): Promise<void>;
+
+  /** Subscribe to connection status, pending operations, and sync time changes */
+  onSyncChange(
+    cb: (state: { connected: boolean; pendingCount: number; lastSync: Date | null }) => void
+  ): () => void;
+
   /** Current connection state */
   readonly connectionState: ConnectionState;
 
@@ -135,7 +153,7 @@ export function createClient(config: MeridianClientConfig): MeridianClient {
     schema,
     serverUrl,
     auth,
-    dbName = simpleHash(serverUrl),
+    dbName = config.dbName || (serverUrl ? simpleHash(serverUrl) : 'meridian_db'),
     debug = false,
     onRollback,
     onConnectionChange,
@@ -146,7 +164,7 @@ export function createClient(config: MeridianClientConfig): MeridianClient {
   const clock = new HLC(nodeId);
 
   // Initialize store
-  const store = new MeridianStore({ dbName, schema, nodeId });
+  const store = new MeridianStore({ dbName, schema, nodeId, encryption: config.encryption });
 
   // Initialize debug manager
   const debugManager = new DebugManager(store);
@@ -157,6 +175,7 @@ export function createClient(config: MeridianClientConfig): MeridianClient {
   // Initialize sync engine
   const syncEngine = new SyncEngine({
     serverUrl,
+    transport: config.transport,
     store,
     auth,
     schemaVersion: schema.version,
@@ -217,6 +236,42 @@ export function createClient(config: MeridianClientConfig): MeridianClient {
 
   // Build the client object
   const client: MeridianClient = {
+    async ready() {
+      await store.init();
+    },
+
+    onSyncChange(cb) {
+      const trigger = async () => {
+        try {
+          const pending = await store.getPendingOps();
+          const lastSyncVal = debugManager.getLastSyncTime();
+          cb({
+            connected: syncEngine.connectionState === 'connected',
+            pendingCount: pending.length,
+            lastSync: lastSyncVal ? new Date(lastSyncVal) : null,
+          });
+        } catch (e) {
+          // Store might be closed or during initialization
+        }
+      };
+
+      const unsubState = syncEngine.onStateChange(() => {
+        trigger();
+      });
+
+      const unsubPending = store.onPendingOpsChange(() => {
+        trigger();
+      });
+
+      // Initial execution
+      trigger();
+
+      return () => {
+        unsubState();
+        unsubPending();
+      };
+    },
+
     get connectionState() {
       return syncEngine.connectionState;
     },
@@ -250,7 +305,9 @@ export function createClient(config: MeridianClientConfig): MeridianClient {
         console.log(`[Meridian] 🚀 Client initialized`);
         console.log(`[Meridian] 📋 Node ID: ${nodeId}`);
         console.log(`[Meridian] 📦 Collections: ${Object.keys(schema.collections).join(', ')}`);
-        console.log(`[Meridian] 🔗 Server: ${serverUrl}`);
+        if (serverUrl) {
+          console.log(`[Meridian] 🔗 Server: ${serverUrl}`);
+        }
       }
     } catch (e) {
       console.error('[Meridian] ❌ Initialization failed:', e);

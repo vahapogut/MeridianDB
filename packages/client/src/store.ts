@@ -92,8 +92,10 @@ export interface DocWithMeta {
  */
 export class MeridianStore {
   private db: IDBPDatabase | null = null;
-  private readonly config: StoreConfig;
+  private initPromise: Promise<void> | null = null;
+  public readonly config: StoreConfig;
   private changeListeners: Map<string, Set<(docId: string) => void>> = new Map();
+  private pendingOpsChangeCallbacks: Set<() => void> = new Set();
 
   constructor(config: StoreConfig) {
     this.config = config;
@@ -124,52 +126,63 @@ export class MeridianStore {
    * Initialize IndexedDB — creates/upgrades stores as needed.
    */
   async init(): Promise<void> {
+    if (this.initPromise) return this.initPromise;
+
     const { dbName, schema } = this.config;
     const collectionNames = Object.keys(schema.collections);
 
-    try {
-      this.db = await openDB(`${DB_NAME_PREFIX}_${dbName}`, schema.version, {
-        upgrade(db, oldVersion, newVersion) {
-          // Create collection stores
-          for (const name of collectionNames) {
-            if (!db.objectStoreNames.contains(name)) {
-              const store = db.createObjectStore(name, { keyPath: 'id' });
-              // Create index for every field except id to enable O(1) finds
-              const schemaDef = schema.collections[name];
-              if (schemaDef) {
-                for (const field of Object.keys(schemaDef)) {
-                  if (field !== 'id') store.createIndex(field, field);
+    this.initPromise = (async () => {
+      try {
+        this.db = await openDB(`${DB_NAME_PREFIX}_${dbName}`, schema.version, {
+          upgrade(db, oldVersion, newVersion) {
+            // Create collection stores
+            for (const name of collectionNames) {
+              if (!db.objectStoreNames.contains(name)) {
+                const store = db.createObjectStore(name, { keyPath: 'id' });
+                // Create index for every field except id to enable O(1) finds
+                const schemaDef = schema.collections[name];
+                if (schemaDef) {
+                  for (const field of Object.keys(schemaDef)) {
+                    if (field !== 'id') store.createIndex(field, field);
+                  }
                 }
               }
             }
-          }
 
-          // Create metadata store
-          if (!db.objectStoreNames.contains(META_STORE)) {
-            db.createObjectStore(META_STORE);
-          }
+            // Create metadata store
+            if (!db.objectStoreNames.contains(META_STORE)) {
+              db.createObjectStore(META_STORE);
+            }
 
-          // Create pending ops store
-          if (!db.objectStoreNames.contains(PENDING_STORE)) {
-            const store = db.createObjectStore(PENDING_STORE, { keyPath: 'id' });
-            store.createIndex('status', 'status');
-            store.createIndex('createdAt', 'createdAt');
-          }
+            // Create pending ops store
+            if (!db.objectStoreNames.contains(PENDING_STORE)) {
+              const store = db.createObjectStore(PENDING_STORE, { keyPath: 'id' });
+              store.createIndex('status', 'status');
+              store.createIndex('createdAt', 'createdAt');
+            }
 
-          // Create sync state store
-          if (!db.objectStoreNames.contains(SYNC_STATE_STORE)) {
-            db.createObjectStore(SYNC_STATE_STORE);
-          }
-        },
-      });
-    } catch (err) {
-      wrapIDBError(err, 'init');
-    }
+            // Create sync state store
+            if (!db.objectStoreNames.contains(SYNC_STATE_STORE)) {
+              db.createObjectStore(SYNC_STATE_STORE);
+            }
+          },
+        });
+      } catch (err) {
+        wrapIDBError(err, 'init');
+      }
+    })();
+
+    return this.initPromise;
   }
 
-  private ensureDB(): IDBPDatabase {
+  private async ensureReady(): Promise<IDBPDatabase> {
+    if (!this.initPromise) {
+      await this.init();
+    } else {
+      await this.initPromise;
+    }
     if (!this.db) {
-      throw new Error('[Meridian Store] Database not initialized. Call init() first.');
+      throw new Error('[Meridian Store] Database not initialized.');
     }
     return this.db;
   }
@@ -181,7 +194,7 @@ export class MeridianStore {
    * Returns null if not found or soft-deleted.
    */
   async getDoc(collection: string, docId: string): Promise<Record<string, unknown> | null> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     const doc = await db.get(collection, docId);
     if (!doc) return null;
 
@@ -196,7 +209,7 @@ export class MeridianStore {
    * Get a document with its CRDT metadata.
    */
   async getDocWithMeta(collection: string, docId: string): Promise<DocWithMeta | null> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     const doc = await db.get(collection, docId);
     if (!doc) return null;
 
@@ -218,7 +231,7 @@ export class MeridianStore {
     hlc: string,
     nodeId: string
   ): Promise<PendingOp[]> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     const docId = doc.id as string;
     const schema = this.config.schema.collections[collection];
     const pendingOps: PendingOp[] = [];
@@ -290,6 +303,7 @@ export class MeridianStore {
     }
 
     await tx.done;
+    this.notifyPendingOpsChange();
 
     // Notify listeners
     this.notifyChange(collection, docId);
@@ -326,7 +340,7 @@ export class MeridianStore {
     hlc: string,
     nodeId: string
   ): Promise<PendingOp[]> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     const existingMeta = await this.getMeta(collection, docId);
 
     if (!existingMeta) {
@@ -362,6 +376,7 @@ export class MeridianStore {
 
     await tx.objectStore(PENDING_STORE).put(pendingOp);
     await tx.done;
+    this.notifyPendingOpsChange();
 
     this.notifyChange(collection, docId);
 
@@ -376,7 +391,7 @@ export class MeridianStore {
     collection: string,
     filter?: Record<string, unknown>
   ): Promise<Record<string, unknown>[]> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     
     // Check if we can optimize with an IDBIndex
     let allDocs: any[];
@@ -431,7 +446,7 @@ export class MeridianStore {
    * Performs CRDT merge — only accepts changes with higher HLC.
    */
   async applyRemoteChanges(ops: CRDTOperation[]): Promise<string[]> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     const affectedDocs: Set<string> = new Set();
 
     // Group ops by collection:docId
@@ -495,7 +510,7 @@ export class MeridianStore {
   // ─── CRDT Metadata ─────────────────────────────────────────────────────────
 
   private async getMeta(collection: string, docId: string): Promise<LWWMap | null> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     return (await db.get(META_STORE, `${collection}:${docId}`)) ?? null;
   }
 
@@ -505,7 +520,7 @@ export class MeridianStore {
    * Get all pending operations (not yet acknowledged by server).
    */
   async getPendingOps(): Promise<PendingOp[]> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     const all = await db.getAll(PENDING_STORE);
     return all.filter(op => op.status === 'pending' || op.status === 'sending');
   }
@@ -514,7 +529,7 @@ export class MeridianStore {
    * Mark operations as sending (in-flight to server).
    */
   async markOpsSending(opIds: string[]): Promise<void> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     const tx = db.transaction(PENDING_STORE, 'readwrite');
 
     for (const id of opIds) {
@@ -527,13 +542,14 @@ export class MeridianStore {
     }
 
     await tx.done;
+    this.notifyPendingOpsChange();
   }
 
   /**
    * Acknowledge operations (server confirmed persistence).
    */
   async ackOps(opIds: string[]): Promise<void> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     const tx = db.transaction(PENDING_STORE, 'readwrite');
 
     for (const id of opIds) {
@@ -541,13 +557,14 @@ export class MeridianStore {
     }
 
     await tx.done;
+    this.notifyPendingOpsChange();
   }
 
   /**
    * Rollback rejected operations to their previous values.
    */
   async rollbackOp(opId: string): Promise<PendingOp | null> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     const pendingOp = await db.get(PENDING_STORE, opId);
 
     if (!pendingOp) return null;
@@ -572,12 +589,14 @@ export class MeridianStore {
         await tx.objectStore(collection).put(values);
         await tx.objectStore(PENDING_STORE).delete(opId);
         await tx.done;
+        this.notifyPendingOpsChange();
 
         this.notifyChange(collection, docId);
       }
     } else {
       // No previous value — just remove the pending op
       await db.delete(PENDING_STORE, opId);
+      this.notifyPendingOpsChange();
     }
 
     return pendingOp;
@@ -587,7 +606,7 @@ export class MeridianStore {
    * Reset all pending ops to 'pending' status (e.g., on reconnect).
    */
   async resetPendingStatus(): Promise<void> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     const all = await db.getAll(PENDING_STORE);
     const tx = db.transaction(PENDING_STORE, 'readwrite');
 
@@ -599,6 +618,7 @@ export class MeridianStore {
     }
 
     await tx.done;
+    this.notifyPendingOpsChange();
   }
 
   // ─── Sync State ─────────────────────────────────────────────────────────────
@@ -607,7 +627,7 @@ export class MeridianStore {
    * Get the last known server sequence number.
    */
   async getLastSeq(): Promise<number> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     return (await db.get(SYNC_STATE_STORE, 'lastSeq')) ?? 0;
   }
 
@@ -615,7 +635,7 @@ export class MeridianStore {
    * Update the last known server sequence number.
    */
   async setLastSeq(seq: number): Promise<void> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     await db.put(SYNC_STATE_STORE, seq, 'lastSeq');
   }
 
@@ -625,7 +645,7 @@ export class MeridianStore {
    * Clear all data (used for full re-sync after compaction gap).
    */
   async clearAll(): Promise<void> {
-    const db = this.ensureDB();
+    const db = await this.ensureReady();
     const storeNames = Array.from(db.objectStoreNames);
     const tx = db.transaction(storeNames, 'readwrite');
 
@@ -634,9 +654,25 @@ export class MeridianStore {
     }
 
     await tx.done;
+    this.notifyPendingOpsChange();
   }
 
   // ─── Change Listeners ──────────────────────────────────────────────────────
+
+  onPendingOpsChange(cb: () => void): () => void {
+    this.pendingOpsChangeCallbacks.add(cb);
+    return () => this.pendingOpsChangeCallbacks.delete(cb);
+  }
+
+  private notifyPendingOpsChange(): void {
+    for (const cb of this.pendingOpsChangeCallbacks) {
+      try {
+        cb();
+      } catch (e) {
+        console.error('[Meridian Store] Pending ops change listener error:', e);
+      }
+    }
+  }
 
   /**
    * Register a listener for document changes in a collection.

@@ -326,6 +326,18 @@ The PostgreSQL server assigns a monotonically increasing `SeqNum` to every opera
 ### Compaction & Tombstones
 Deleted rows are converted to tombstones (soft-deleted). A background compaction scheduler periodically cleans up tombstones older than 30 days. If an offline client connects after a compaction event, Meridian detects the gap and triggers a `full-sync-required` event to self-heal.
 
+### E2E In-Transit Encryption
+In addition to at-rest document encryption, Meridian v2.0 supports strict End-to-End (E2E) in-transit encryption. When enabled, operation payloads are encrypted using AES-256-GCM prior to being pushed over the `Transport`. Pull operations are decrypted locally upon receipt. Because the sync server only stores and routes the encrypted base64 ciphertext, it acts as a completely blind broker, preventing eavesdropping or data leakage on the server side.
+
+### Pluggable Transports & Heartbeats
+The v2.0 client decouples direct dependencies on browser WebSocket globals by operating through a generic `Transport` interface. This allows syncing over WebSockets, WebRTC, custom TCP sockets, or custom simulated testing layers. The default `WebSocketTransport` is hardened to automatically parse and respond to raw, non-JSON string `'ping'` / `'pong'` heartbeats initiated by the server without disrupting message parsing.
+
+### Race-Condition Free Initialization (`ready()`)
+To eliminate timing issues where an app attempts database operations before storage adapters are fully open, Meridian v2.0 client features a cached `ready()` promise. CRUD operations initiated during the boot phase are automatically queued internally and resolved once the underlying IndexedDB/SQLite connection is established, ensuring flawless developer experience.
+
+### Event-Driven Framework Subscriptions
+Rather than using resource-intensive periodic polling (`setInterval`) to update connection and sync state in UI frameworks, the v2.0 sync engine uses an event-driven pub/sub model via `client.onSyncChange(callback)`. React, Vue, and Svelte framework packages are fully updated to utilize this interface, dropping CPU usage during idle connection periods to zero.
+
 ## V2 Roadmap
 
 Meridian is evolving to become the ultimate infra product for local-first development.
@@ -367,6 +379,13 @@ Meridian is evolving to become the ultimate infra product for local-first develo
 - [x] **Observability:** Prometheus-compatible MetricsCollector — P95/P99 latency, ops/sec, uptime.
 - [x] **GraphQL Subscriptions:** `MeridianPubSub` — Apollo/yoga compatible async iterator.
 - [x] **WebRTC P2P Transport:** `WebRTCTransport` — serverless peer-to-peer sync via DataChannel.
+
+### Done in v2.0.0 (Event-Driven & Pluggable Sync Architecture)
+- [x] **Asynchronous Client Queueing:** Eliminates boot race conditions by caching initialization in `db.ready()` and queuing CRUD operations automatically until store readiness.
+- [x] **Pluggable Transport Layer:** Decouples the client sync loop from hardcoded WebSocket instances, accepting any `Transport` compliant provider.
+- [x] **Raw Heartbeat Support:** Strengthened `WebSocketTransport` to handle raw string `'ping'` and `'pong'` frames, avoiding JSON parser failures on server heartbeats.
+- [x] **End-to-End (E2E) In-Transit Encryption:** Integrated AES-256-GCM encryption/decryption directly into the transport push and pull pipelines. The central server acts only as a blind ciphertext storage.
+- [x] **Zero-Polling Reactivity:** Refactored React, Vue, and Svelte 5 `useSync` bindings from continuous 1000ms `setInterval` polling to an efficient event-driven pub/sub pattern (`onSyncChange`).
 
 ### Coming Next
 - [ ] **TypeDoc API docs:** Full generated API documentation site.

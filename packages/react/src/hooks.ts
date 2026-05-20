@@ -132,16 +132,11 @@ export function useSync(client: MeridianClient) {
   });
 
   useEffect(() => {
-    const interval = setInterval(async () => {
-      const pending = await client.debug.getPendingOps();
-      setState({
-        connected: client.connectionState === 'connected',
-        pendingCount: pending.length,
-        lastSync: client.debug.getLastSyncTime(),
-      });
-    }, 1000);
-    return () => clearInterval(interval);
-  }, []);
+    const unsub = client.onSyncChange((nextState) => {
+      setState(nextState);
+    });
+    return unsub;
+  }, [client]);
 
   return {
     connected: state.connected,
